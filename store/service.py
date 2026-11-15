@@ -28,7 +28,7 @@ class OrderService:
         if type(coupon_valid) is not bool:
             raise ValueError("Ознака купона має бути логічною")
         subtotal = unit_price * quantity
-        discount = 15 if subtotal >= 120_000 and coupon_valid else 0
+        discount = 10 if subtotal >= 120_000 and coupon_valid else 0
         return subtotal - subtotal * discount // 100
 
     def place_order(self, request: OrderRequest) -> Order:
