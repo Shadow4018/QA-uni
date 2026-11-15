@@ -1,0 +1,219 @@
+name: CI
+
+# Trigger: pipeline запускається автоматично після push у будь-яку гілку та після pull request.
+# workflow_dispatch додано лише як додаткову можливість ручного запуску.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Шляхи до тестів студента: за потреби змініть під свою структуру репозиторію
+  UNIT_TESTS: tests/unit
+  DB_INTEGRATION_TESTS: tests/test_order_integration.py
+  CONTAINER_INTEGRATION_TESTS: tests/integration
+  API_TESTS: tests/api
+
+jobs:
+  # ---------- Stage 1: build ----------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-ci.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . -r requirements-ci.txt
+      - name: Check that sources compile
+        run: python -m compileall -q store
+      - name: Build wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel
+      - name: Verify the built package installs and imports
+        run: |
+          python -m venv "$RUNNER_TEMP/verify"
+          "$RUNNER_TEMP/verify/bin/pip" install dist/*.whl
+          "$RUNNER_TEMP/verify/bin/python" -c "import store.service, store.repositories; print('package OK')"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+          retention-days: 14
+
+  # ---------- Stage 2: unit tests ----------
+  unit-tests:
+    name: Unit tests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-ci.txt
+      - name: Install dependencies
+        run: python -m pip install -e . -r requirements-ci.txt
+      - name: Run unit tests
+        run: python -m pytest "$UNIT_TESTS" -ra --junitxml=reports/unit.xml
+      - name: Test report summary
+        if: ${{ !cancelled() }}
+        run: python .github/scripts/junit_summary.py "Unit tests" reports/unit.xml >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------- Stage 3a: integration tests (PostgreSQL) ----------
+  integration-tests:
+    name: Integration tests
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: store_student
+          POSTGRES_PASSWORD: ci_password   # одноразова БД у контейнері на час job, не секрет
+          POSTGRES_DB: store_variant04_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U store_student -d store_variant04_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: store_variant04_test
+      DB_USER: store_student
+      DB_PASSWORD: ci_password
+      PGPASSWORD: ci_password
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-ci.txt
+      - name: Install dependencies
+        run: python -m pip install -e . -r requirements-ci.txt
+      - name: Show testcontainers version
+        run: python -m pip show testcontainers
+      - name: Apply database migrations
+        run: |
+          for file in migrations/V*__*.sql; do
+            echo "Applying $file"
+            psql -h localhost -U store_student -d store_variant04_test -v ON_ERROR_STOP=1 -f "$file"
+          done
+      - name: Repository and service tests against PostgreSQL
+        run: python -m pytest "$DB_INTEGRATION_TESTS" tests/test_environment.py -ra --junitxml=reports/integration-db.xml
+      - name: Isolated integration tests (Testcontainers + WireMock)
+        if: ${{ !cancelled() }}
+        run: python -m pytest "$CONTAINER_INTEGRATION_TESTS" -ra --junitxml=reports/integration-containers.xml
+      - name: Test report summary
+        if: ${{ !cancelled() }}
+        run: python .github/scripts/junit_summary.py "Integration tests" reports/integration-db.xml reports/integration-containers.xml >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-report
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------- Stage 3b: REST API tests ----------
+  api-tests:
+    name: API tests
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: store_student
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: store_variant04_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U store_student -d store_variant04_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: store_variant04_test
+      DB_USER: store_student
+      DB_PASSWORD: ci_password
+      PGPASSWORD: ci_password
+      API_BASE_URL: http://127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-ci.txt
+      - name: Install dependencies
+        run: python -m pip install -e . -r requirements-ci.txt
+      - name: Apply database migrations
+        run: |
+          for file in migrations/V*__*.sql; do
+            psql -h localhost -U store_student -d store_variant04_test -v ON_ERROR_STOP=1 -f "$file"
+          done
+      - name: Start the API
+        run: |
+          mkdir -p reports
+          nohup python -m uvicorn store.api:app --host 127.0.0.1 --port 8080 > reports/api-server.log 2>&1 &
+      - name: Wait until the API is ready
+        run: |
+          # очікування умови (відповідь API), а не фіксована пауза
+          for attempt in $(seq 1 30); do
+            if curl -fsS "$API_BASE_URL/docs" > /dev/null; then echo "API is ready"; exit 0; fi
+            sleep 1
+          done
+          echo "::error::API did not start within 30 seconds"
+          cat reports/api-server.log
+          exit 1
+      - name: Run API tests
+        run: python -m pytest "$API_TESTS" -ra --junitxml=reports/api.xml
+      - name: Test report summary
+        if: ${{ !cancelled() }}
+        run: python .github/scripts/junit_summary.py "API tests" reports/api.xml >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload test report and server log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-test-report
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14

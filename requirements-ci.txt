@@ -1,0 +1,6 @@
+# Залежності, потрібні лише для запуску тестів у CI (основні залежності SUT — у pyproject.toml)
+pytest>=8,<9
+requests>=2.31,<3
+testcontainers[postgres]>=4.8
+fastapi>=0.118,<1
+uvicorn>=0.34,<1
